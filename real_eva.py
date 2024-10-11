@@ -9,6 +9,10 @@ import websockets
 import mne
 import os
 from scipy.signal import resample  # 导入重采样函数
+import logging
+
+# 配置日志记录
+logging.basicConfig(level=logging.INFO)
 
 # 定义情绪映射（仅用于推理，不在训练中使用）
 emotion_map = [
@@ -48,7 +52,6 @@ emotion_map = [
     ("pleased", 0.89, -0.10)
 ]
 
-# 函数：根据 Valence 和 Arousal 获取最近的情绪标签
 def get_emotion_label(valence, arousal):
     closest_emotion = None
     min_distance = float('inf')
@@ -61,12 +64,12 @@ def get_emotion_label(valence, arousal):
 
 # 实时预处理函数
 def high_pass_filter_realtime(raw_eeg, l_freq=1.0):
-    print(f"Applying high-pass filter: {l_freq} Hz (real-time, IIR)")
+    logging.info(f"Applying high-pass filter: {l_freq} Hz (real-time, IIR)")
     raw_eeg.filter(l_freq=l_freq, h_freq=None, method='iir')  # 使用 IIR 滤波器
     return raw_eeg
 
 def bandpass_filter_realtime(raw_eeg, l_freq=4.0, h_freq=45.0):
-    print(f"Applying bandpass filter: {l_freq} - {h_freq} Hz (real-time, IIR)")
+    logging.info(f"Applying bandpass filter: {l_freq} - {h_freq} Hz (real-time, IIR)")
     return raw_eeg.filter(l_freq=l_freq, h_freq=h_freq, method='iir')  # 使用 IIR 滤波器
 
 def average_reference_realtime(raw_eeg):
@@ -295,33 +298,48 @@ clients = set()
 
 async def register(websocket):
     clients.add(websocket)
-    try:
-        await websocket.wait_closed()
-    finally:
-        clients.remove(websocket)
+    logging.info(f"Client connected: {websocket.remote_address}")
+
+async def unregister(websocket):
+    clients.remove(websocket)
+    logging.info(f"Client disconnected: {websocket.remote_address}")
 
 async def handler(websocket, path):
+    # Register new client
     await register(websocket)
-    async for message in websocket:
-        for client in clients:
-            if client != websocket:
-                try:
-                    await client.send(message)
-                except websockets.ConnectionClosed:
-                    clients.remove(client)
+    try:
+        # Main loop to handle messages from this client
+        async for message in websocket:
+            logging.info(f"Received message from {websocket.remote_address}: {message}")
+            # Broadcast message to all other clients
+            await broadcast(message, websocket)
+    except websockets.exceptions.ConnectionClosedError:
+        pass  # Connection closed unexpectedly
+    finally:
+        # Unregister client when done
+        await unregister(websocket)
+
+async def broadcast(message, sender):
+    # Send message to all clients except the sender
+    for client in clients:
+        if client != sender:
+            try:
+                await client.send(message)
+            except websockets.exceptions.ConnectionClosedError:
+                logging.warning(f"Failed to send message to {client.remote_address}")
 
 # EEG 数据处理与预测函数
 async def process_eeg_data(model, device, fs, selected_channels):
     # 解析可用的 OpenSignals 流
-    print("# Looking for an available OpenSignals stream...")
+    logging.info("# Looking for an available OpenSignals stream...")
     os_stream = resolve_stream("name", "OpenSignals")
     if len(os_stream) == 0:
-        print("No OpenSignals stream found. Please ensure the EEG device is streaming.")
+        logging.error("No OpenSignals stream found. Please ensure the EEG device is streaming.")
         return
     else:
-        print(f"Found {len(os_stream)} 'OpenSignals' stream(s).")
+        logging.info(f"Found {len(os_stream)} 'OpenSignals' stream(s).")
         for idx, stream in enumerate(os_stream):
-            print(f"Stream {idx+1}: {stream.name()}, {stream.type()}, {stream.channel_count()} channels")
+            logging.info(f"Stream {idx+1}: {stream.name()}, {stream.type()}, {stream.channel_count()} channels")
 
     inlet = StreamInlet(os_stream[0])
 
@@ -338,7 +356,7 @@ async def process_eeg_data(model, device, fs, selected_channels):
         writer.writerow(['Timestamp', 'Valence', 'Arousal', 'Emotion'])
 
         async with websockets.connect('ws://localhost:8769') as websocket:
-            print("WebSocket connection established.")
+            logging.info("WebSocket connection established.")
             while True:
                 try:
                     sample, timestamp = inlet.pull_sample()
@@ -353,7 +371,7 @@ async def process_eeg_data(model, device, fs, selected_channels):
                         if fs != 128:
                             num_samples = 128
                             eeg_buffer_array_resampled = resample(eeg_buffer_array, num_samples, axis=1)
-                            print(f"Resampled data from {fs} Hz to 128 Hz.")
+                            logging.info(f"Resampled data from {fs} Hz to 128 Hz.")
                         else:
                             eeg_buffer_array_resampled = eeg_buffer_array
 
@@ -361,7 +379,7 @@ async def process_eeg_data(model, device, fs, selected_channels):
                         valence, arousal, emotion_label = predict_emotion(
                             eeg_buffer_array_resampled, 128, selected_channels, model, device)
                         if valence is not None and arousal is not None:
-                            print(f"Timestamp: {timestamp}, Valence: {valence}, Arousal: {arousal}, Emotion: {emotion_label}")
+                            logging.info(f"Timestamp: {timestamp}, Valence: {valence}, Arousal: {arousal}, Emotion: {emotion_label}")
 
                             # 保存结果到 CSV
                             writer.writerow([timestamp, valence, arousal, emotion_label])
@@ -375,11 +393,11 @@ async def process_eeg_data(model, device, fs, selected_channels):
                             }
                             await websocket.send(json.dumps(data))
                         else:
-                            print(f"Timestamp: {timestamp}, Prediction Error")
+                            logging.warning(f"Timestamp: {timestamp}, Prediction Error")
                     else:
-                        print("Not enough data, skipping this sample.")
+                        logging.info("Not enough data, skipping this sample.")
                 except Exception as e:
-                    print(f"Error in processing EEG data: {e}")
+                    logging.error(f"Error in processing EEG data: {e}")
 
 # 主函数启动 WebSocket 服务器和 EEG 数据处理
 async def main():
@@ -409,15 +427,15 @@ async def main():
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location=device))
         model.eval()
-        print("Transformer model loaded successfully.")
+        logging.info("Transformer model loaded successfully.")
     else:
-        print(f"Model file {model_path} not found.")
+        logging.error(f"Model file {model_path} not found.")
         return
 
     # 启动 WebSocket 服务器
     server = websockets.serve(handler, "localhost", 8769)
     await server
-    print("WebSocket server started at ws://localhost:8769")
+    logging.info("WebSocket server started at ws://localhost:8769")
 
     # 启动 EEG 数据处理
     await process_eeg_data(model, device, fs=100, selected_channels=['Fp1', 'Fp2'])
